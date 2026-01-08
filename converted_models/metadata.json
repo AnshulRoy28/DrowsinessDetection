@@ -1,0 +1,19 @@
+{
+  "model_name": "best.pt",
+  "conversion_date": "2026-01-08T04:37:15.550168",
+  "input_size": [
+    640,
+    640
+  ],
+  "input_format": "NHWC",
+  "quantized": false,
+  "output_files": {
+    "float32": "best_float32.tflite"
+  },
+  "y2m_version": "1.0.0",
+  "class_names": [
+    "drowsy",
+    "notdrowsy"
+  ],
+  "num_classes": 2
+}

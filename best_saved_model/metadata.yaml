@@ -1,0 +1,22 @@
+description: Ultralytics YOLOv8n-cls model trained on C:/Aditi/UTA_RLDD/dataset_split_resize_4
+author: Ultralytics
+date: '2026-01-08T04:17:08.802867'
+version: 8.3.249
+license: AGPL-3.0 License (https://ultralytics.com/license)
+docs: https://docs.ultralytics.com
+stride: 1
+task: classify
+batch: 1
+imgsz:
+- 640
+- 640
+names:
+  0: drowsy
+  1: notdrowsy
+args:
+  batch: 1
+  fraction: 1.0
+  half: false
+  int8: false
+  nms: false
+channels: 3
