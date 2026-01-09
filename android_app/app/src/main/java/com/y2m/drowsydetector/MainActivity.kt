@@ -3,28 +3,40 @@ package com.y2m.drowsydetector
 import android.Manifest
 import android.content.pm.PackageManager
 import android.graphics.Bitmap
-import android.graphics.Matrix
 import android.os.Bundle
 import android.util.Log
 import android.widget.Toast
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
 import androidx.activity.result.contract.ActivityResultContracts
-import androidx.appcompat.app.AppCompatActivity
 import androidx.camera.core.*
 import androidx.camera.lifecycle.ProcessCameraProvider
+import androidx.camera.view.PreviewView
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
 import androidx.core.content.ContextCompat
-import com.y2m.drowsydetector.databinding.ActivityMainBinding
+import com.y2m.drowsydetector.ui.DrowsinessScreen
+import com.y2m.drowsydetector.ui.theme.DrowsyDetectorTheme
 import kotlinx.coroutines.*
 import java.util.concurrent.ExecutorService
 import java.util.concurrent.Executors
 
-class MainActivity : AppCompatActivity() {
+class MainActivity : ComponentActivity() {
 
-    private lateinit var binding: ActivityMainBinding
-    private lateinit var classifier: DrowsinessClassifier
+    private lateinit var detector: DrowsinessDetector
+    private lateinit var alertManager: AlertManager
     private lateinit var cameraExecutor: ExecutorService
+    private lateinit var previewView: PreviewView
 
     private val scope = CoroutineScope(Dispatchers.Main + SupervisorJob())
     private var isProcessing = false
+    private var frameCount = 0
+    
+    // Compose state
+    private var detectionResult by mutableStateOf(
+        DetectionResult(DrowsinessState.UNKNOWN, 0f, 0f)
+    )
 
     // Permission launcher
     private val permissionLauncher = registerForActivityResult(
@@ -40,12 +52,32 @@ class MainActivity : AppCompatActivity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
-        binding = ActivityMainBinding.inflate(layoutInflater)
-        setContentView(binding.root)
+        
+        Log.d(TAG, "onCreate - initializing...")
 
-        // Initialize classifier
-        classifier = DrowsinessClassifier(this)
+        // Initialize components
+        try {
+            detector = DrowsinessDetector(this)
+            Log.d(TAG, "Detector initialized successfully")
+        } catch (e: Exception) {
+            Log.e(TAG, "Failed to initialize detector", e)
+            Toast.makeText(this, "Failed to load model: ${e.message}", Toast.LENGTH_LONG).show()
+            return
+        }
+        
+        alertManager = AlertManager(this)
         cameraExecutor = Executors.newSingleThreadExecutor()
+        previewView = PreviewView(this)
+
+        // Set Compose content
+        setContent {
+            DrowsyDetectorTheme {
+                DrowsinessScreen(
+                    detectionResult = detectionResult,
+                    previewView = previewView
+                )
+            }
+        }
 
         // Check camera permission
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
@@ -58,6 +90,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     private fun startCamera() {
+        Log.d(TAG, "Starting camera...")
         val cameraProviderFuture = ProcessCameraProvider.getInstance(this)
 
         cameraProviderFuture.addListener({
@@ -67,13 +100,14 @@ class MainActivity : AppCompatActivity() {
             val preview = Preview.Builder()
                 .build()
                 .also {
-                    it.setSurfaceProvider(binding.cameraPreview.surfaceProvider)
+                    it.setSurfaceProvider(previewView.surfaceProvider)
                 }
 
-            // Image analysis use case
+            // Image analysis - request RGBA for easy processing
             val imageAnalyzer = ImageAnalysis.Builder()
-                .setTargetResolution(android.util.Size(640, 640))
+                .setTargetResolution(android.util.Size(640, 480))
                 .setBackpressureStrategy(ImageAnalysis.STRATEGY_KEEP_ONLY_LATEST)
+                .setOutputImageFormat(ImageAnalysis.OUTPUT_IMAGE_FORMAT_RGBA_8888)
                 .build()
                 .also {
                     it.setAnalyzer(cameraExecutor) { imageProxy ->
@@ -81,7 +115,7 @@ class MainActivity : AppCompatActivity() {
                     }
                 }
 
-            // Use front camera for drowsiness detection
+            // Use front camera
             val cameraSelector = CameraSelector.DEFAULT_FRONT_CAMERA
 
             try {
@@ -89,6 +123,7 @@ class MainActivity : AppCompatActivity() {
                 cameraProvider.bindToLifecycle(
                     this, cameraSelector, preview, imageAnalyzer
                 )
+                Log.d(TAG, "Camera bound successfully")
             } catch (e: Exception) {
                 Log.e(TAG, "Camera binding failed", e)
             }
@@ -103,23 +138,48 @@ class MainActivity : AppCompatActivity() {
         }
 
         isProcessing = true
+        frameCount++
 
         scope.launch(Dispatchers.Default) {
             try {
-                // Convert ImageProxy to Bitmap
                 val bitmap = imageProxyToBitmap(imageProxy)
                 
-                // Run classification
-                val (label, confidence) = classifier.classify(bitmap)
-                val isDrowsy = label == "Drowsy"
+                if (bitmap == null) {
+                    Log.e(TAG, "Failed to convert image to bitmap")
+                    isProcessing = false
+                    imageProxy.close()
+                    return@launch
+                }
 
-                // Update UI on main thread
+                // Run detection with smoothing
+                val result = detector.processFrame(bitmap)
+                
+                if (frameCount % 30 == 0) {
+                    Log.d(TAG, "Frame $frameCount: ${result.state} (${result.confidence})")
+                }
+
+                // Update UI state
                 withContext(Dispatchers.Main) {
-                    updateUI(label, confidence, isDrowsy)
+                    detectionResult = result
+                    
+                    // Manage alerts
+                    when (result.state) {
+                        DrowsinessState.DROWSY -> {
+                            if (!alertManager.isAlarmPlaying()) {
+                                alertManager.startAlarm()
+                            }
+                        }
+                        DrowsinessState.AWAKE -> {
+                            if (alertManager.isAlarmPlaying()) {
+                                alertManager.stopAlarm()
+                            }
+                        }
+                        else -> { /* No action for unknown state */ }
+                    }
                 }
 
             } catch (e: Exception) {
-                Log.e(TAG, "Classification error", e)
+                Log.e(TAG, "Processing error", e)
             } finally {
                 imageProxy.close()
                 isProcessing = false
@@ -127,59 +187,32 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap {
-        val buffer = imageProxy.planes[0].buffer
-        val bytes = ByteArray(buffer.remaining())
-        buffer.get(bytes)
-
-        // Convert YUV to bitmap (simplified - using the Y plane as grayscale)
-        val bitmap = Bitmap.createBitmap(
-            imageProxy.width,
-            imageProxy.height,
-            Bitmap.Config.ARGB_8888
-        )
-
-        // For proper conversion, you'd use YuvToRgbConverter
-        // This is a simplified version
-        val yBuffer = imageProxy.planes[0].buffer
-        val ySize = yBuffer.remaining()
-        val yBytes = ByteArray(ySize)
-        yBuffer.get(yBytes)
-
-        val pixels = IntArray(imageProxy.width * imageProxy.height)
-        for (i in pixels.indices) {
-            val y = yBytes[i].toInt() and 0xFF
-            pixels[i] = (0xFF shl 24) or (y shl 16) or (y shl 8) or y
-        }
-        bitmap.setPixels(pixels, 0, imageProxy.width, 0, 0, imageProxy.width, imageProxy.height)
-
-        // Rotate if needed
-        val matrix = Matrix().apply {
-            postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
-        }
-        
-        return Bitmap.createBitmap(bitmap, 0, 0, bitmap.width, bitmap.height, matrix, true)
-    }
-
-    private fun updateUI(label: String, confidence: Float, isDrowsy: Boolean) {
-        // Update status text
-        binding.statusText.text = label
-        binding.confidenceText.text = "Confidence: ${(confidence * 100).toInt()}%"
-
-        // Update background color based on drowsiness
-        val color = if (isDrowsy) {
-            getColor(android.R.color.holo_red_light)
-        } else {
-            getColor(android.R.color.holo_green_light)
-        }
-        binding.statusCard.setCardBackgroundColor(color)
-
-        // Show warning if drowsy
-        if (isDrowsy && confidence > 0.7f) {
-            binding.warningText.text = "⚠️ DROWSINESS DETECTED!"
-            binding.warningText.visibility = android.view.View.VISIBLE
-        } else {
-            binding.warningText.visibility = android.view.View.GONE
+    private fun imageProxyToBitmap(imageProxy: ImageProxy): Bitmap? {
+        return try {
+            val buffer = imageProxy.planes[0].buffer
+            val pixelStride = imageProxy.planes[0].pixelStride
+            val rowStride = imageProxy.planes[0].rowStride
+            val rowPadding = rowStride - pixelStride * imageProxy.width
+            
+            val bitmapWidth = imageProxy.width + rowPadding / pixelStride
+            val bitmap = Bitmap.createBitmap(bitmapWidth, imageProxy.height, Bitmap.Config.ARGB_8888)
+            
+            buffer.rewind()
+            bitmap.copyPixelsFromBuffer(buffer)
+            
+            // Crop to actual size
+            val croppedBitmap = Bitmap.createBitmap(bitmap, 0, 0, imageProxy.width, imageProxy.height)
+            
+            // Rotate and mirror for front camera
+            val matrix = android.graphics.Matrix().apply {
+                postRotate(imageProxy.imageInfo.rotationDegrees.toFloat())
+                postScale(-1f, 1f) // Mirror
+            }
+            
+            Bitmap.createBitmap(croppedBitmap, 0, 0, croppedBitmap.width, croppedBitmap.height, matrix, true)
+        } catch (e: Exception) {
+            Log.e(TAG, "Error converting image", e)
+            null
         }
     }
 
@@ -187,7 +220,8 @@ class MainActivity : AppCompatActivity() {
         super.onDestroy()
         scope.cancel()
         cameraExecutor.shutdown()
-        classifier.close()
+        detector.close()
+        alertManager.release()
     }
 
     companion object {
